@@ -14,8 +14,11 @@ in sync when the wire format changes.
 
 - **register** — a node announces its GPU type and search-software version.
 - **targets** — a node downloads the current search list.
-- **block/request** — a node leases a 216-bit (27-byte) prefix, one block of
-  `2^40` keys. Leases expire; a dead node's block is reclaimed and re-handed.
+- **block/request** — the server hands the node a **randomly chosen** 216-bit
+  (27-byte) prefix, one block of `2^40` keys. Leases expire; if a block is not
+  completed within `lease_seconds` its prefix is re-handed to the **next** node
+  that asks, with priority over minting a new random block, so no abandoned
+  prefix is dropped.
 - **block/complete** — a node reports a block done and how long it took.
 - **match** — a node reports the 32-byte private key and 33-byte compressed
   public key, both hex. **The server recomputes the public key from the private
@@ -54,6 +57,7 @@ keygen.py              make an Ed25519+X25519 identity (shared with keyhunt-node
 coord.example.json     sample configuration
 make_test_targets.py   build a target list, optionally with a planted key
 test_e2e.py            live-server integration + security tests
+test_random_prefix.py  unit tests for random prefixes + expired-block reassignment
 _testclient.py         minimal client used only by test_e2e.py
 ```
 
@@ -68,7 +72,7 @@ Copy `coord.example.json` to `coord.json` and edit:
 
 ```json
 {
-  "space_prefix": "abcdef0123456789abcdef0123456789abcdef0123456789",
+  "space_prefix": "",
   "targets_file": "targets.txt",
   "lease_seconds": 3600,
   "max_blocks": 1048576,
@@ -77,10 +81,14 @@ Copy `coord.example.json` to `coord.json` and edit:
 }
 ```
 
-`space_prefix` is the fixed high part of the key space, in hex, shorter than 54
-characters. The server appends the remaining nibbles to enumerate blocks: 48 hex
-here leaves 6 nibbles, so up to `16^6` blocks, each a distinct 54-hex (27-byte)
-prefix covering `2^40` keys. Set `require_approval: true` to hold new nodes in a
+Each block is a random 54-hex (27-byte, 216-bit) prefix covering the `2^40` keys
+below it. By default (`space_prefix` empty) prefixes are drawn from the full
+`2^216` space using OS entropy — an effectively infinite, non-repeating hunt.
+Set `space_prefix` to a hex string shorter than 54 characters to pin the
+high-order bits and draw the remaining nibbles at random; this lets you split
+the space across several independent servers by giving each a different fixed
+prefix. There is no dedup: the space is astronomically large, so a pure random
+draw effectively never collides. Set `require_approval: true` to hold new nodes in a
 `pending` state until you set them `active` in the database by hand.
 
 Provide a `targets.txt` (one compressed pubkey per line). Then run:
@@ -112,23 +120,47 @@ network.
 ## Test
 
 ```
-python3 make_test_targets.py --count 1000 \
-    --plant abcdef0123456789abcdef0123456789abcdef0123456789000005:0x1234ABCD \
-    > targets.txt
-python3 test_e2e.py
+python3 test_random_prefix.py      # block model, no server needed
+python3 test_e2e.py                # full live-server run (generate fixtures first)
 ```
 
+`test_random_prefix.py` drives the `Coordinator` directly and checks that new
+blocks get distinct random 216-bit prefixes, that a `space_prefix` constraint is
+honoured, and — the core of this behaviour — that an expired lease is re-handed
+to the next requester with the same prefix and a bumped attempt count, taking
+priority over minting a new block. It also confirms only the current holder can
+complete a block after a reassignment.
+
 `test_e2e.py` starts a real server on a random localhost port and checks
-registration, target download, in-order block leasing, completion, rejection of
-un-owned and nonexistent blocks, match verification (including a node lying
-about the keypair), duplicate detection, stats, and four security properties:
-tampered ciphertext, replayed sequence number, wrong recipient, and an
-unregistered node trying to lease. All must pass.
+registration, target download, random-prefix block leasing across two nodes,
+completion, rejection of nonexistent-block completion, match verification
+(including a node lying about the keypair), duplicate detection, stats, and four
+security properties: tampered ciphertext, replayed sequence number, wrong
+recipient, and an unregistered node trying to lease. Generate fixtures first:
+
+```
+python3 keygen.py server.key
+python3 keygen.py node1.key
+python3 - <<'PY'
+import json, random
+from secp import compressed, N
+random.seed(3); priv = random.randrange(1, N)
+lines = [compressed(priv)] + [compressed(random.randrange(1, N)) for _ in range(999)]
+random.shuffle(lines); open("targets.txt","w").write("\n".join(lines)+"\n")
+json.dump({"targets_file":"targets.txt","lease_seconds":3600}, open("coord.json","w"))
+json.dump({"priv":"%064x"%priv,"pub":compressed(priv)}, open("planted.json","w"))
+PY
+python3 test_e2e.py
+```
 
 ## Notes and limits
 
 - A 40-bit block takes minutes to an hour on one GPU. Set `lease_seconds` above
-  your slowest node's block time, or you will reclaim blocks still being worked.
+  your slowest node's block time, or a block still being worked will be declared
+  expired and its prefix handed to another node — wasting the original node's
+  effort, since only the *current* leaseholder can report a block complete. A
+  node whose lease has lapsed should just request again rather than report a
+  block it no longer holds.
 - `keys_checked` in a completion is trusted for throughput stats only; it never
   affects correctness. Matches are always re-verified.
 - Every match report is stored, including unverified ones, with a note

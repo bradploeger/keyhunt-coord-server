@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import sqlite3
 import sys
 import threading
@@ -52,8 +53,9 @@ CREATE TABLE IF NOT EXISTS nodes (
   keys_checked  INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS blocks (
-  idx           INTEGER PRIMARY KEY,
-  state         TEXT NOT NULL DEFAULT 'free',
+  idx           INTEGER PRIMARY KEY AUTOINCREMENT,
+  prefix        TEXT NOT NULL,        -- the randomly chosen 54-hex (216-bit) prefix
+  state         TEXT NOT NULL DEFAULT 'leased',  -- leased | expired | done
   node_id       TEXT,
   leased_at     REAL,
   lease_expires REAL,
@@ -61,7 +63,8 @@ CREATE TABLE IF NOT EXISTS blocks (
   seconds       REAL,
   attempts      INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS blocks_state ON blocks(state, idx);
+-- Expired blocks are re-handed oldest-first, so index by (state, lease_expires).
+CREATE INDEX IF NOT EXISTS blocks_state ON blocks(state, lease_expires);
 CREATE TABLE IF NOT EXISTS matches (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   node_id      TEXT,
@@ -88,14 +91,18 @@ class Coordinator:
         self.ed_hex = secret["ed25519"]
         self.x_hex = secret["x25519"]
 
-        self.space_prefix = cfg["space_prefix"].lower()
+        # Optional high-order constraint. Empty (the default) means prefixes are
+        # drawn from the full 2^216 space; a non-empty value pins the top bits,
+        # e.g. to carve the space between several independent servers.
+        self.space_prefix = str(cfg.get("space_prefix", "")).lower()
         if len(self.space_prefix) >= PREFIX_HEX_LEN:
             raise SystemExit("space_prefix must be shorter than %d hex chars" % PREFIX_HEX_LEN)
-        int(self.space_prefix, 16)
-        self.nibbles = PREFIX_HEX_LEN - len(self.space_prefix)
-        self.num_blocks = min(16 ** self.nibbles, int(cfg.get("max_blocks", 1 << 20)))
+        if self.space_prefix:
+            int(self.space_prefix, 16)          # validate hex
+        self.random_nibbles = PREFIX_HEX_LEN - len(self.space_prefix)
         self.lease_seconds = float(cfg.get("lease_seconds", LEASE_SECONDS))
         self.require_approval = bool(cfg.get("require_approval", False))
+        self.rng = random.SystemRandom()
 
         with open(targets_path) as f:
             self.targets = [l.strip().lower() for l in f
@@ -104,19 +111,11 @@ class Coordinator:
         self.targets_digest = hashlib.sha256(
             "\n".join(self.targets).encode()).hexdigest()
 
-        self._seed_blocks()
-
-    def _seed_blocks(self):
-        with self.lock:
-            have = self.db.execute("SELECT COUNT(*) FROM blocks").fetchone()[0]
-            if have < self.num_blocks:
-                self.db.executemany(
-                    "INSERT OR IGNORE INTO blocks(idx) VALUES (?)",
-                    [(i,) for i in range(have, self.num_blocks)])
-                self.db.commit()
-
-    def block_prefix(self, idx):
-        return self.space_prefix + ("%0*x" % (self.nibbles, idx))
+    def random_prefix(self):
+        """A fresh random 54-hex (216-bit) prefix, respecting any space_prefix
+        constraint. Pure random, drawn from os-backed entropy; no dedup."""
+        rnd = self.rng.getrandbits(4 * self.random_nibbles)
+        return self.space_prefix + ("%0*x" % (self.random_nibbles, rnd))
 
     # ------------------------------------------------------------- node state
     def get_node(self, nid):
@@ -173,28 +172,47 @@ class Coordinator:
 
     def op_block_request(self, nid, p):
         now = time.time()
-        # reclaim anything whose lease ran out
-        self.db.execute(
-            "UPDATE blocks SET state='free', node_id=NULL, leased_at=NULL, "
-            "lease_expires=NULL WHERE state='leased' AND lease_expires < ?", (now,))
-        row = self.db.execute(
-            "SELECT idx FROM blocks WHERE state='free' ORDER BY attempts, idx LIMIT 1"
-        ).fetchone()
-        if not row:
-            rem = self.db.execute(
-                "SELECT COUNT(*) FROM blocks WHERE state!='done'").fetchone()[0]
-            self.db.commit()
-            return {"ok": False, "error": "no blocks available",
-                    "outstanding": rem, "retry_after": 60}
-        idx = row[0]
         exp = now + self.lease_seconds
+
+        # Any block whose lease ran out without a completion is now 'expired'.
+        # These take priority: an unfinished prefix must be searched by someone.
         self.db.execute(
-            "UPDATE blocks SET state='leased', node_id=?, leased_at=?, "
-            "lease_expires=?, attempts=attempts+1 WHERE idx=?", (nid, now, exp, idx))
+            "UPDATE blocks SET state='expired' "
+            "WHERE state='leased' AND lease_expires < ?", (now,))
+
+        # 1. Re-hand the oldest expired block, if there is one. Oldest-first so a
+        #    prefix that has been waiting longest gets covered soonest.
+        row = self.db.execute(
+            "SELECT idx, prefix FROM blocks WHERE state='expired' "
+            "ORDER BY lease_expires LIMIT 1").fetchone()
+        if row:
+            idx, prefix = row
+            self.db.execute(
+                "UPDATE blocks SET state='leased', node_id=?, leased_at=?, "
+                "lease_expires=?, attempts=attempts+1 WHERE idx=?",
+                (nid, now, exp, idx))
+            self.db.commit()
+            return {"ok": True, "block_idx": idx, "prefix": prefix,
+                    "reassigned": True, "attempts": self._attempts(idx),
+                    "unknown_bits": 256 - 4 * PREFIX_HEX_LEN,
+                    "lease_expires": exp, "lease_seconds": self.lease_seconds}
+
+        # 2. Otherwise mint a brand-new block with a fresh random prefix.
+        prefix = self.random_prefix()
+        cur = self.db.execute(
+            "INSERT INTO blocks(prefix, state, node_id, leased_at, lease_expires, "
+            "attempts) VALUES (?,'leased',?,?,?,1) RETURNING idx",
+            (prefix, nid, now, exp))
+        idx = cur.fetchone()[0]
         self.db.commit()
-        return {"ok": True, "block_idx": idx, "prefix": self.block_prefix(idx),
+        return {"ok": True, "block_idx": idx, "prefix": prefix,
+                "reassigned": False, "attempts": 1,
                 "unknown_bits": 256 - 4 * PREFIX_HEX_LEN,
                 "lease_expires": exp, "lease_seconds": self.lease_seconds}
+
+    def _attempts(self, idx):
+        r = self.db.execute("SELECT attempts FROM blocks WHERE idx=?", (idx,)).fetchone()
+        return r[0] if r else 0
 
     def op_block_complete(self, nid, p):
         try:
@@ -213,8 +231,16 @@ class Coordinator:
         state, owner = row
         if state == "done":
             return {"ok": True, "note": "already recorded"}
+
+        # Only the node currently holding the lease may complete it. If A's lease
+        # expired and the prefix was re-handed to B, A's late report is stale: B is
+        # now searching that prefix, and marking it done here would waste B's work.
+        # A 'reassigned' flag on the request tells the node when it has picked up
+        # someone else's abandoned block; a node that finds its lease gone should
+        # simply request again rather than report a block it no longer owns.
         if owner != nid:
-            return {"ok": False, "error": "block is not leased to you"}
+            return {"ok": False, "error": "block is not leased to you "
+                    "(lease may have expired and been reassigned)"}
 
         self.db.execute(
             "UPDATE blocks SET state='done', completed_at=?, seconds=? WHERE idx=?",
@@ -290,14 +316,15 @@ class Coordinator:
             d["keys_per_sec"] = (d["keys_checked"] / d["total_seconds"]
                                  if d["total_seconds"] > 0 else None)
             nodes.append(d)
-        free, leased, done = (self.db.execute(
-            "SELECT SUM(state='free'), SUM(state='leased'), SUM(state='done') FROM blocks"
-        ).fetchone())
+        leased, expired, done = (self.db.execute(
+            "SELECT SUM(state='leased'), SUM(state='expired'), SUM(state='done') "
+            "FROM blocks").fetchone())
         nmatch = self.db.execute(
             "SELECT COUNT(*) FROM matches WHERE verified=1 AND in_targets=1").fetchone()[0]
         return {"ok": True, "nodes": nodes,
-                "blocks": {"free": free or 0, "leased": leased or 0,
-                           "done": done or 0, "total": self.num_blocks},
+                "blocks": {"leased": leased or 0, "expired": expired or 0,
+                           "done": done or 0,
+                           "total": (leased or 0) + (expired or 0) + (done or 0)},
                 "verified_matches": nmatch,
                 "targets_digest": self.targets_digest}
 
@@ -415,9 +442,12 @@ def main():
     print("server ed25519 : %s" % coord.ed_hex)
     print("server x25519  : %s" % coord.x_hex)
     print("targets        : %d  digest %s" % (len(coord.targets), coord.targets_digest[:16]))
-    print("block space    : %s + %d nibbles = %d blocks of 2^%d keys"
-          % (coord.space_prefix, coord.nibbles, coord.num_blocks,
-             256 - 4 * PREFIX_HEX_LEN))
+    space_desc = ("full 2^216 space" if not coord.space_prefix
+                  else "%s + %d random nibbles" % (coord.space_prefix, coord.random_nibbles))
+    print("block space    : %s, random prefixes, each block 2^%d keys"
+          % (space_desc, 256 - 4 * PREFIX_HEX_LEN))
+    print("lease          : %g s; expired blocks re-handed to the next node"
+          % coord.lease_seconds)
     print("listening on   : %s:%d" % (a.host, a.port))
     ThreadingHTTPServer((a.host, a.port), make_handler(coord)).serve_forever()
 

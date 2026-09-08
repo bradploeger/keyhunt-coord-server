@@ -41,37 +41,46 @@ def main():
     check("planted key present", planted["pub"] in t["targets"])
     check("digest matches register", t["digest"] == r["targets_digest"])
 
-    print("\n[block lease + complete]")
-    # Lease blocks until we've held the planted one, completing each as we go.
-    # Blocks are handed out in ascending index order, so this terminates fast.
-    seen = set()
-    blk = None
+    print("\n[block lease + complete: random prefixes]")
+    seen_prefixes = set()
+    seen_idx = set()
     completed = 0
-    for _ in range(planted["block_idx"] + 5):
+    for _ in range(20):
         b = n.request_block()
-        check("block ok", b.get("ok")) if len(seen) == 0 else None
-        seen.add(b["block_idx"])
-        if b["block_idx"] == planted["block_idx"]:
-            blk = b
-        secs = 812.4 if b["block_idx"] == planted["block_idx"] else 100.0 + b["block_idx"]
-        cr = n.complete_block(b["block_idx"], seconds=secs, keys_checked=1 << 40)
+        check("block ok", b.get("ok")) if len(seen_idx) == 0 else None
+        check("prefix is 216-bit (54 hex)", len(b["prefix"]) == 54) if len(seen_idx) == 0 else None
+        check("fresh block not reassigned", b.get("reassigned") is False) if len(seen_idx) == 0 else None
+        seen_prefixes.add(b["prefix"])
+        seen_idx.add(b["block_idx"])
+        cr = n.complete_block(b["block_idx"], seconds=100.0 + b["block_idx"] % 7,
+                              keys_checked=1 << 40)
         if cr.get("ok") and not cr.get("note"):
             completed += 1
-        if blk is not None:
-            break
-    check("distinct blocks leased in order", len(seen) == planted["block_idx"] + 1)
-    check("planted block leased", blk is not None)
-    check("all leases completed", completed == len(seen))
+    check("20 distinct random prefixes", len(seen_prefixes) == 20)
+    check("20 distinct block ids", len(seen_idx) == 20)
+    check("all leases completed", completed == 20)
 
-    print("\n[completing someone else's block is refused]")
-    other = Node("node1.key", url, sinfo["ed25519"], sinfo["x25519"])
-    # lease a fresh block as node1, then try to complete a not-owned index
-    b2 = n.request_block()
-    bad = n.complete_block(999999, seconds=1.0)   # nonexistent
+    print("\n[nonexistent block completion is refused]")
+    bad = n.complete_block(999999, seconds=1.0)
     check("nonexistent block rejected", not bad.get("ok"))
 
+    print("\n[a second node gets its own distinct random prefix]")
+    if not os.path.exists("node2.key"):
+        from protocol import generate_identity, write_key_file
+        sec2, pub2 = generate_identity()
+        write_key_file("node2.key", sec2, secret=True)
+        write_key_file("node2.pub", pub2)
+    n_b = Node("node2.key", url, sinfo["ed25519"], sinfo["x25519"])
+    n_b.register(gpu="RTX 3090", sw="keyhunt-gpu 1.0")
+    bb = n_b.request_block()
+    check("second node leased ok", bb.get("ok"))
+    check("second node prefix differs", bb["prefix"] not in seen_prefixes)
+    n_b.complete_block(bb["block_idx"], seconds=90.0, keys_checked=1 << 40)
+    # (full expired-lease reassignment across nodes is covered in
+    #  test_random_prefix.py, which can control lease timing directly.)
+
     print("\n[match: verified + in targets]")
-    mr = n.report_match(planted["priv"], planted["pub"], block_idx=planted["block_idx"])
+    mr = n.report_match(planted["priv"], planted["pub"])
     check("match verified", mr.get("verified") is True)
     check("match in targets", mr.get("in_targets") is True)
     dup = n.report_match(planted["priv"], planted["pub"])
@@ -88,7 +97,7 @@ def main():
     st = n.stats()
     check("stats ok", st.get("ok"))
     node_row = st["nodes"][0]
-    check("blocks_done recorded", node_row["blocks_done"] == len(seen))
+    check("blocks_done recorded", node_row["blocks_done"] == len(seen_idx))
     check("avg seconds computed", node_row["avg_seconds_per_block"] is not None)
     check("keys/sec computed", node_row["keys_per_sec"] is not None)
     check("verified match counted", st["verified_matches"] == 1)

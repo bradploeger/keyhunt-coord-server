@@ -9,19 +9,21 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
+      - name: unit tests (random-prefix block model)
+        run: python3 test_random_prefix.py
       - name: integration + security tests
         run: |
           python3 keygen.py server.key
           python3 keygen.py node1.key
-          python3 make_test_targets.py --count 1000 \
-            --plant abcdef0123456789abcdef0123456789abcdef0123456789000005:0x1234ABCD \
-            > targets.txt
           python3 - <<'PY'
-          import json
-          from secp import compressed
-          space="abcdef0123456789abcdef0123456789abcdef0123456789"
-          priv=(int(space+"%06x"%5,16)<<40)+0x1234ABCD
-          json.dump({"space_prefix":space,"targets_file":"targets.txt","lease_seconds":3600,"max_blocks":4096},open("coord.json","w"))
-          json.dump({"priv":"%064x"%priv,"pub":compressed(priv),"block_idx":5},open("planted.json","w"))
+          import json, random
+          from secp import compressed, N
+          random.seed(3)
+          priv = random.randrange(1, N)
+          lines = [compressed(priv)] + [compressed(random.randrange(1, N)) for _ in range(999)]
+          random.shuffle(lines)
+          open("targets.txt", "w").write("\n".join(lines) + "\n")
+          json.dump({"targets_file": "targets.txt", "lease_seconds": 3600}, open("coord.json", "w"))
+          json.dump({"priv": "%064x" % priv, "pub": compressed(priv)}, open("planted.json", "w"))
           PY
           python3 test_e2e.py
