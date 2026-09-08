@@ -1,0 +1,8 @@
+{
+  "space_prefix": "abcdef0123456789abcdef0123456789abcdef0123456789",
+  "targets_file": "targets.txt",
+  "lease_seconds": 3600,
+  "max_blocks": 1048576,
+  "require_approval": false,
+  "match_hook": ""
+}

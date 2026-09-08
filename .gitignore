@@ -1,0 +1,27 @@
+# Secrets and generated identities -- NEVER commit these.
+# Distribute server.pub to nodes out-of-band, not through git.
+*.key
+*.pub
+
+# Runtime state and generated data
+*.db
+targets.txt
+coord.json
+planted.json
+found.txt
+state.txt
+
+# Keep example configs (they have no '.key'/'.pub'/'.db' suffix, so they are safe)
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
