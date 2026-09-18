@@ -14,11 +14,14 @@ in sync when the wire format changes.
 
 - **register** — a node announces its GPU type and search-software version.
 - **targets** — a node downloads the current search list.
-- **block/request** — the server hands the node a **randomly chosen** 216-bit
-  (27-byte) prefix, one block of `2^40` keys. Leases expire; if a block is not
-  completed within `lease_seconds` its prefix is re-handed to the **next** node
-  that asks, with priority over minting a new random block, so no abandoned
-  prefix is dropped.
+- **block/request** — the server hands the node a 216-bit (27-byte) prefix, one
+  block of `2^40` keys. The choice follows a strict priority: (1) any **expired**
+  block — a prefix whose lease ran out without completion — is re-handed to the
+  next node that asks, so no abandoned prefix is dropped; (2) otherwise, if the
+  operator supplied a **prefix list** (`prefix_list_file`), the next unassigned
+  prefix from that file, in file order; (3) otherwise a fresh **random** prefix.
+  The response carries `reassigned` and `from_list` flags saying which path it
+  took.
 - **block/complete** — a node reports a block done and how long it took.
 - **match** — a node reports the 32-byte private key and 33-byte compressed
   public key, both hex. **The server recomputes the public key from the private
@@ -58,6 +61,7 @@ coord.example.json     sample configuration
 make_test_targets.py   build a target list, optionally with a planted key
 test_e2e.py            live-server integration + security tests
 test_random_prefix.py  unit tests for random prefixes + expired-block reassignment
+test_prefix_list.py    unit tests for the preassigned prefix-list feature
 _testclient.py         minimal client used only by test_e2e.py
 ```
 
@@ -73,23 +77,48 @@ Copy `coord.example.json` to `coord.json` and edit:
 ```json
 {
   "space_prefix": "",
+  "prefix_list_file": "prefixes.txt",
   "targets_file": "targets.txt",
   "lease_seconds": 3600,
-  "max_blocks": 1048576,
   "require_approval": false,
   "match_hook": "curl -s -d 'FOUND %K' https://ntfy.sh/your-topic"
 }
 ```
 
-Each block is a random 54-hex (27-byte, 216-bit) prefix covering the `2^40` keys
-below it. By default (`space_prefix` empty) prefixes are drawn from the full
-`2^216` space using OS entropy — an effectively infinite, non-repeating hunt.
-Set `space_prefix` to a hex string shorter than 54 characters to pin the
-high-order bits and draw the remaining nibbles at random; this lets you split
-the space across several independent servers by giving each a different fixed
-prefix. There is no dedup: the space is astronomically large, so a pure random
-draw effectively never collides. Set `require_approval: true` to hold new nodes in a
-`pending` state until you set them `active` in the database by hand.
+Each block is a 54-hex (27-byte, 216-bit) prefix covering the `2^40` keys below
+it. With no `prefix_list_file` and an empty `space_prefix`, prefixes are drawn
+from the full `2^216` space using OS entropy — an effectively infinite,
+non-repeating hunt. Set `space_prefix` to a hex string shorter than 54
+characters to pin the high-order bits and draw the remaining nibbles at random;
+this lets you split the space across several independent servers by giving each
+a different fixed prefix. There is no dedup on random draws: the space is
+astronomically large, so a pure random draw effectively never collides. Set
+`require_approval: true` to hold new nodes in a `pending` state until you set
+them `active` in the database by hand.
+
+### Checking a specific list of prefixes first
+
+Point `prefix_list_file` at a text file of prefixes you want searched before the
+server falls back to random assignment — for example a shortlist of ranges you
+have reason to prioritise. One prefix per line; blank lines and `#` comments are
+ignored; each prefix must be exactly 54 hex characters (a single `2^40`-key
+block) and, if `space_prefix` is set, must start with it. Malformed or
+out-of-space lines are skipped with a count reported at startup.
+
+```
+# prefixes.txt — 216-bit prefixes to check first, in this order
+0000000000000000000000000000000000000000000000000000a1
+0000000000000000000000000000000000000000000000000000a2
+0000000000000000000000000000000000000000000000000000a3
+```
+
+Listed prefixes are handed out in file order, ahead of any random prefix but
+behind expired blocks (an unfinished prefix is always re-covered first).
+Loading is **idempotent across restarts**: a prefix already recorded in the
+database — leased, done, or still waiting — is not re-added, so you can restart
+the server, or append more lines to the file and restart, without duplicating
+work. Progress shows up in `stats` as `blocks.pending` (listed prefixes not yet
+handed out).
 
 Provide a `targets.txt` (one compressed pubkey per line). Then run:
 
@@ -120,7 +149,8 @@ network.
 ## Test
 
 ```
-python3 test_random_prefix.py      # block model, no server needed
+python3 test_random_prefix.py      # random block model, no server needed
+python3 test_prefix_list.py        # preassigned prefix-list feature, no server needed
 python3 test_e2e.py                # full live-server run (generate fixtures first)
 ```
 
@@ -130,6 +160,12 @@ honoured, and — the core of this behaviour — that an expired lease is re-han
 to the next requester with the same prefix and a bumped attempt count, taking
 priority over minting a new block. It also confirms only the current holder can
 complete a block after a reassignment.
+
+`test_prefix_list.py` checks the preassigned prefix list: listed prefixes are
+handed out in file order ahead of random assignment, expired blocks still take
+priority over the list, malformed and out-of-`space_prefix` lines are skipped,
+the list falls back to random once exhausted, seeding is idempotent across a
+restart, and `stats` reports the pending count.
 
 `test_e2e.py` starts a real server on a random localhost port and checks
 registration, target download, random-prefix block leasing across two nodes,

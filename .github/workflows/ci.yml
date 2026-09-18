@@ -11,6 +11,8 @@ jobs:
       - run: pip install -r requirements.txt
       - name: unit tests (random-prefix block model)
         run: python3 test_random_prefix.py
+      - name: unit tests (preassigned prefix list)
+        run: python3 test_prefix_list.py
       - name: integration + security tests
         run: |
           python3 keygen.py server.key

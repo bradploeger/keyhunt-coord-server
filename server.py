@@ -54,8 +54,8 @@ CREATE TABLE IF NOT EXISTS nodes (
 );
 CREATE TABLE IF NOT EXISTS blocks (
   idx           INTEGER PRIMARY KEY AUTOINCREMENT,
-  prefix        TEXT NOT NULL,        -- the randomly chosen 54-hex (216-bit) prefix
-  state         TEXT NOT NULL DEFAULT 'leased',  -- leased | expired | done
+  prefix        TEXT NOT NULL,        -- the 54-hex (216-bit) prefix for this block
+  state         TEXT NOT NULL DEFAULT 'leased',  -- pending | leased | expired | done
   node_id       TEXT,
   leased_at     REAL,
   lease_expires REAL,
@@ -111,11 +111,66 @@ class Coordinator:
         self.targets_digest = hashlib.sha256(
             "\n".join(self.targets).encode()).hexdigest()
 
+        # Optional explicit prefix list: prefixes to hand out (in file order)
+        # before falling back to random assignment.
+        self.pending_seed = self._seed_pending(cfg.get("prefix_list_file"))
+
     def random_prefix(self):
         """A fresh random 54-hex (216-bit) prefix, respecting any space_prefix
         constraint. Pure random, drawn from os-backed entropy; no dedup."""
         rnd = self.rng.getrandbits(4 * self.random_nibbles)
         return self.space_prefix + ("%0*x" % (self.random_nibbles, rnd))
+
+    def _seed_pending(self, path):
+        """Load an optional text file of 216-bit prefixes and seed each as a
+        'pending' block, in file order, to be handed out before any random
+        prefix. One prefix per line; blank lines and '#' comments ignored; each
+        must be exactly 54 hex chars (a single 2^40-key block) and, if a
+        space_prefix is configured, must start with it.
+
+        Idempotent across restarts: a prefix already present in the blocks table
+        (in any state) is skipped, so re-running the server -- or adding more
+        lines to the file and restarting -- never double-counts work.
+        Returns {added, skipped_bad, skipped_dup}."""
+        stats = {"added": 0, "skipped_bad": 0, "skipped_dup": 0}
+        if not path:
+            return stats
+        try:
+            with open(path) as f:
+                lines = f.readlines()
+        except OSError as e:
+            raise SystemExit("cannot open prefix_list_file %s: %s" % (path, e))
+
+        with self.lock:
+            existing = {r[0] for r in self.db.execute("SELECT prefix FROM blocks")}
+            seen = set()
+            for ln in lines:
+                s = ln.strip().lower()
+                if not s or s.startswith("#"):
+                    continue
+                if len(s) != PREFIX_HEX_LEN:
+                    stats["skipped_bad"] += 1
+                    continue
+                try:
+                    int(s, 16)
+                except ValueError:
+                    stats["skipped_bad"] += 1
+                    continue
+                if self.space_prefix and not s.startswith(self.space_prefix):
+                    stats["skipped_bad"] += 1
+                    continue
+                if s in existing or s in seen:
+                    stats["skipped_dup"] += 1
+                    continue
+                seen.add(s)
+                self.db.execute(
+                    "INSERT INTO blocks(prefix, state, node_id, leased_at, "
+                    "lease_expires, attempts) VALUES (?, 'pending', NULL, NULL, "
+                    "NULL, 0)", (s,))
+                stats["added"] += 1
+            if stats["added"]:
+                self.db.commit()
+        return stats
 
     # ------------------------------------------------------------- node state
     def get_node(self, nid):
@@ -193,11 +248,28 @@ class Coordinator:
                 (nid, now, exp, idx))
             self.db.commit()
             return {"ok": True, "block_idx": idx, "prefix": prefix,
-                    "reassigned": True, "attempts": self._attempts(idx),
+                    "reassigned": True, "from_list": False,
+                    "attempts": self._attempts(idx),
                     "unknown_bits": 256 - 4 * PREFIX_HEX_LEN,
                     "lease_expires": exp, "lease_seconds": self.lease_seconds}
 
-        # 2. Otherwise mint a brand-new block with a fresh random prefix.
+        # 2. Otherwise hand out the next preassigned prefix, in file order, if
+        #    the operator supplied a prefix list and any remain unassigned.
+        row = self.db.execute(
+            "SELECT idx, prefix FROM blocks WHERE state='pending' "
+            "ORDER BY idx LIMIT 1").fetchone()
+        if row:
+            idx, prefix = row
+            self.db.execute(
+                "UPDATE blocks SET state='leased', node_id=?, leased_at=?, "
+                "lease_expires=?, attempts=1 WHERE idx=?", (nid, now, exp, idx))
+            self.db.commit()
+            return {"ok": True, "block_idx": idx, "prefix": prefix,
+                    "reassigned": False, "from_list": True, "attempts": 1,
+                    "unknown_bits": 256 - 4 * PREFIX_HEX_LEN,
+                    "lease_expires": exp, "lease_seconds": self.lease_seconds}
+
+        # 3. Otherwise mint a brand-new block with a fresh random prefix.
         prefix = self.random_prefix()
         cur = self.db.execute(
             "INSERT INTO blocks(prefix, state, node_id, leased_at, lease_expires, "
@@ -206,7 +278,7 @@ class Coordinator:
         idx = cur.fetchone()[0]
         self.db.commit()
         return {"ok": True, "block_idx": idx, "prefix": prefix,
-                "reassigned": False, "attempts": 1,
+                "reassigned": False, "from_list": False, "attempts": 1,
                 "unknown_bits": 256 - 4 * PREFIX_HEX_LEN,
                 "lease_expires": exp, "lease_seconds": self.lease_seconds}
 
@@ -316,15 +388,16 @@ class Coordinator:
             d["keys_per_sec"] = (d["keys_checked"] / d["total_seconds"]
                                  if d["total_seconds"] > 0 else None)
             nodes.append(d)
-        leased, expired, done = (self.db.execute(
-            "SELECT SUM(state='leased'), SUM(state='expired'), SUM(state='done') "
-            "FROM blocks").fetchone())
+        leased, expired, done, pending = (self.db.execute(
+            "SELECT SUM(state='leased'), SUM(state='expired'), SUM(state='done'), "
+            "SUM(state='pending') FROM blocks").fetchone())
         nmatch = self.db.execute(
             "SELECT COUNT(*) FROM matches WHERE verified=1 AND in_targets=1").fetchone()[0]
         return {"ok": True, "nodes": nodes,
                 "blocks": {"leased": leased or 0, "expired": expired or 0,
-                           "done": done or 0,
-                           "total": (leased or 0) + (expired or 0) + (done or 0)},
+                           "done": done or 0, "pending": pending or 0,
+                           "total": (leased or 0) + (expired or 0) + (done or 0)
+                                    + (pending or 0)},
                 "verified_matches": nmatch,
                 "targets_digest": self.targets_digest}
 
@@ -448,6 +521,14 @@ def main():
           % (space_desc, 256 - 4 * PREFIX_HEX_LEN))
     print("lease          : %g s; expired blocks re-handed to the next node"
           % coord.lease_seconds)
+    if cfg.get("prefix_list_file"):
+        s = coord.pending_seed
+        waiting = coord.db.execute(
+            "SELECT COUNT(*) FROM blocks WHERE state='pending'").fetchone()[0]
+        print("prefix list    : %s  (+%d new, %d bad, %d dup this start; %d awaiting a node)"
+              % (cfg["prefix_list_file"], s["added"], s["skipped_bad"],
+                 s["skipped_dup"], waiting))
+        print("                 these are handed out in file order before any random prefix")
     print("listening on   : %s:%d" % (a.host, a.port))
     ThreadingHTTPServer((a.host, a.port), make_handler(coord)).serve_forever()
 
