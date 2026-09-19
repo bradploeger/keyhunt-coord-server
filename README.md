@@ -72,7 +72,7 @@ pip install -r requirements.txt
 python3 keygen.py server.key       # -> server.key (secret), server.pub (share)
 ```
 
-Copy `coord.example.json` to `coord.json` and edit:
+Copy `coord.json` to `coord.json` and edit:
 
 ```json
 {
