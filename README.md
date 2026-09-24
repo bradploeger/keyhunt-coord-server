@@ -37,6 +37,22 @@ the same per-node numbers (node id, GPU type, prefixes requested / processed
 rate) for viewing in a browser. It's safe to leave open to the public --
 a node id is already its Ed25519 public key.
 
+### Live console stats
+
+While running, the server redraws a small table on its console every 5 seconds
+with rolling numbers for the last 10 minutes, last hour and last 24 hours:
+nodes seen, blocks requested, blocks expired, blocks completed, and effective
+rate (keys from blocks completed in the window / window length). The table
+updates in place; if anything else is printed (errors, a MATCH banner), a
+fresh table starts below it so nothing is overwritten. `--stats-interval N`
+changes the refresh period; `--stats-interval 0` turns it off.
+
+The numbers come from an `events` table in `coord.db` (pruned to ~25 hours).
+On the first start after upgrading, it is backfilled from the `blocks` table,
+so the first 24h figures are approximate. Until the server has a full window
+of history, the rate for that window is marked `*` and averaged over the
+history available.
+
 ## Security model
 
 Two keypairs per party: **Ed25519** for signing (this is the node id) and

@@ -16,6 +16,11 @@ Endpoints, all POST, all taking an envelope:
   /v1/stats           per-node and global counters
 
   /healthz            plain GET, no auth, liveness only
+
+While running, the server also redraws a live stats table on the console every
+--stats-interval seconds (default 5; 0 turns it off): nodes seen, blocks
+requested / expired / completed, and effective keys/second over the last
+10 minutes, hour and 24 hours.
 """
 
 import argparse
@@ -37,6 +42,11 @@ import secp
 PREFIX_HEX_LEN = 54          # 27 bytes = 216 bits
 LEASE_SECONDS = 3600         # 1 hour
 MAX_BODY = 8 * 1024 * 1024
+BLOCK_KEYS = 1 << (256 - 4 * PREFIX_HEX_LEN)   # keys in one block (2^40)
+
+# Rolling windows shown on the live console display: (label, seconds).
+STATS_WINDOWS = (("last 10m", 600), ("last 1h", 3600), ("last 24h", 86400))
+EVENT_RETENTION = 86400 + 3600   # keep a little more than the widest window
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS nodes (
@@ -67,6 +77,17 @@ CREATE TABLE IF NOT EXISTS blocks (
 );
 -- Expired blocks are re-handed oldest-first, so index by (state, lease_expires).
 CREATE INDEX IF NOT EXISTS blocks_state ON blocks(state, lease_expires);
+-- Append-only log of block lifecycle events for the rolling console stats.
+-- kind is 'request' | 'expire' | 'complete'; keys is set on 'complete'.
+-- Pruned to the last ~25 hours.
+CREATE TABLE IF NOT EXISTS events (
+  ts            REAL NOT NULL,
+  kind          TEXT NOT NULL,
+  node_id       TEXT,
+  block_idx     INTEGER,
+  keys          INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS events_kind_ts ON events(kind, ts);
 CREATE TABLE IF NOT EXISTS matches (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   node_id      TEXT,
@@ -89,8 +110,14 @@ class Coordinator:
         self.cfg = cfg
         self.lock = threading.Lock()
         self.db = sqlite3.connect(db_path, check_same_thread=False)
+        had_events = self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+        ).fetchone() is not None
         self.db.executescript(SCHEMA)
         self.db.commit()
+        self.started_at = time.time()
+        if not had_events:
+            self._backfill_events()
         # Migration for databases created before blocks_requested existed.
         try:
             self.db.execute(
@@ -184,6 +211,84 @@ class Coordinator:
                 self.db.commit()
         return stats
 
+    # ------------------------------------------------------------ event log
+    def _log_event(self, kind, nid, idx, keys=0, ts=None):
+        self.db.execute(
+            "INSERT INTO events(ts, kind, node_id, block_idx, keys) VALUES (?,?,?,?,?)",
+            (time.time() if ts is None else ts, kind, nid, idx, int(keys)))
+
+    def _backfill_events(self):
+        """First start on a database that predates the events table: seed the
+        last 24h of history from the blocks table so the rolling stats aren't
+        empty. Approximate -- the blocks table only keeps each block's latest
+        lease, and per-block key counts weren't stored, so completions are
+        counted at the nominal 2^40 keys per block."""
+        since = time.time() - EVENT_RETENTION
+        self.db.execute(
+            "INSERT INTO events(ts, kind, node_id, block_idx, keys) "
+            "SELECT leased_at, 'request', node_id, idx, 0 FROM blocks "
+            "WHERE leased_at IS NOT NULL AND leased_at >= ?", (since,))
+        self.db.execute(
+            "INSERT INTO events(ts, kind, node_id, block_idx, keys) "
+            "SELECT lease_expires, 'expire', node_id, idx, 0 FROM blocks "
+            "WHERE state='expired' AND lease_expires >= ?", (since,))
+        self.db.execute(
+            "INSERT INTO events(ts, kind, node_id, block_idx, keys) "
+            "SELECT completed_at, 'complete', node_id, idx, ? FROM blocks "
+            "WHERE state='done' AND completed_at >= ?", (BLOCK_KEYS, since))
+        self.db.commit()
+
+    def _expire_leases(self, now):
+        """Mark every lease that ran out without a completion as 'expired',
+        logging each expiry at the moment the lease actually lapsed. Caller
+        holds self.lock and commits."""
+        rows = self.db.execute(
+            "SELECT idx, node_id, lease_expires FROM blocks "
+            "WHERE state='leased' AND lease_expires < ?", (now,)).fetchall()
+        for idx, owner, exp in rows:
+            self._log_event("expire", owner, idx, ts=exp)
+        if rows:
+            self.db.execute(
+                "UPDATE blocks SET state='expired' "
+                "WHERE state='leased' AND lease_expires < ?", (now,))
+        return len(rows)
+
+    def window_stats(self, now=None):
+        """Rolling stats for each of STATS_WINDOWS. Also sweeps expired leases
+        (so expiries show up when they happen, not when the next node asks for
+        work) and prunes old events. Takes self.lock.
+
+        Effective rate is keys from blocks completed in the window divided by
+        the window length -- or by the available history, if the server has
+        less than a full window of it (flagged by 'partial')."""
+        now = time.time() if now is None else now
+        with self.lock:
+            self._expire_leases(now)
+            self.db.execute("DELETE FROM events WHERE ts < ?",
+                            (now - EVENT_RETENTION,))
+            self.db.commit()
+            first = self.db.execute("SELECT MIN(ts) FROM events").fetchone()[0]
+            origin = min(self.started_at, first if first is not None else now)
+            out = []
+            for label, secs in STATS_WINDOWS:
+                cut = now - secs
+                nodes = self.db.execute(
+                    "SELECT COUNT(*) FROM nodes WHERE last_seen >= ?",
+                    (cut,)).fetchone()[0]
+                req, exp, done, keys = self.db.execute(
+                    "SELECT COALESCE(SUM(kind='request'),0), "
+                    "COALESCE(SUM(kind='expire'),0), "
+                    "COALESCE(SUM(kind='complete'),0), "
+                    "COALESCE(SUM(CASE WHEN kind='complete' THEN keys END),0) "
+                    "FROM events WHERE ts >= ? AND ts <= ?", (cut, now)).fetchone()
+                span = max(1.0, min(float(secs), now - origin))
+                out.append({"label": label, "seconds": secs, "nodes": nodes,
+                            "requested": req, "expired": exp, "completed": done,
+                            "keys": keys, "span": span,
+                            "partial": span < secs - 1,
+                            "keys_per_sec": keys / span})
+        return out
+
     # ------------------------------------------------------------- node state
     def get_node(self, nid):
         r = self.db.execute(
@@ -243,9 +348,7 @@ class Coordinator:
 
         # Any block whose lease ran out without a completion is now 'expired'.
         # These take priority: an unfinished prefix must be searched by someone.
-        self.db.execute(
-            "UPDATE blocks SET state='expired' "
-            "WHERE state='leased' AND lease_expires < ?", (now,))
+        self._expire_leases(now)
 
         # 1. Re-hand the oldest expired block, if there is one. Oldest-first so a
         #    prefix that has been waiting longest gets covered soonest.
@@ -260,6 +363,7 @@ class Coordinator:
                 (nid, now, exp, idx))
             self.db.execute(
                 "UPDATE nodes SET blocks_requested=blocks_requested+1 WHERE id=?", (nid,))
+            self._log_event("request", nid, idx, ts=now)
             self.db.commit()
             return {"ok": True, "block_idx": idx, "prefix": prefix,
                     "reassigned": True, "from_list": False,
@@ -279,6 +383,7 @@ class Coordinator:
                 "lease_expires=?, attempts=1 WHERE idx=?", (nid, now, exp, idx))
             self.db.execute(
                 "UPDATE nodes SET blocks_requested=blocks_requested+1 WHERE id=?", (nid,))
+            self._log_event("request", nid, idx, ts=now)
             self.db.commit()
             return {"ok": True, "block_idx": idx, "prefix": prefix,
                     "reassigned": False, "from_list": True, "attempts": 1,
@@ -294,6 +399,7 @@ class Coordinator:
         idx = cur.fetchone()[0]
         self.db.execute(
             "UPDATE nodes SET blocks_requested=blocks_requested+1 WHERE id=?", (nid,))
+        self._log_event("request", nid, idx, ts=now)
         self.db.commit()
         return {"ok": True, "block_idx": idx, "prefix": prefix,
                 "reassigned": False, "from_list": False, "attempts": 1,
@@ -339,6 +445,7 @@ class Coordinator:
             "UPDATE nodes SET blocks_done=blocks_done+1, total_seconds=total_seconds+?, "
             "keys_checked=keys_checked+?, last_seen=? WHERE id=?",
             (secs, keys, time.time(), nid))
+        self._log_event("complete", nid, idx, keys=keys)
         self.db.commit()
         done, total = self.db.execute(
             "SELECT (SELECT COUNT(*) FROM blocks WHERE state='done'), COUNT(*) FROM blocks"
@@ -638,12 +745,132 @@ class Coordinator:
             return 200, reply
 
 
+# ---------------------------------------------------------------- live console
+def _enable_ansi(stream):
+    """True if the stream is a terminal that understands ANSI cursor codes.
+    On Windows this switches on virtual-terminal processing for the console."""
+    try:
+        if not stream.isatty():
+            return False
+    except Exception:
+        return False
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.GetStdHandle(-11)                     # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not k32.GetConsoleMode(h, ctypes.byref(mode)):
+            return False
+        return bool(k32.SetConsoleMode(h, mode.value | 0x0004))  # VT processing
+    except Exception:
+        return False
+
+
+class LiveConsole:
+    """Redraws the stats table in place. stdout/stderr are wrapped so that any
+    other output (errors, MATCH banners, request logs) marks the screen dirty:
+    the next redraw then starts a fresh table below it instead of overwriting,
+    so nothing that was logged is ever erased."""
+
+    class _Tracked:
+        def __init__(self, console, stream):
+            self._c, self._s = console, stream
+
+        def write(self, s):
+            with self._c.lock:
+                if s:
+                    self._c.dirty = True
+                return self._s.write(s)
+
+        def flush(self):
+            return self._s.flush()
+
+        def __getattr__(self, name):
+            return getattr(self._s, name)
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.out, self.err = sys.stdout, sys.stderr
+        self.ansi = _enable_ansi(self.out)
+        self.dirty = True
+        self.lines = 0
+        sys.stdout = self._Tracked(self, self.out)
+        sys.stderr = self._Tracked(self, self.err)
+
+    def draw(self, lines):
+        with self.lock:
+            self.err.flush()
+            if self.ansi and not self.dirty and self.lines:
+                # cursor to start of the previous table, clear to end of screen
+                self.out.write("\x1b[%dF\x1b[J" % self.lines)
+            else:
+                self.out.write("\n")          # fresh table below other output
+            self.out.write("\n".join(lines) + "\n")
+            self.out.flush()
+            self.lines = len(lines)
+            self.dirty = False
+
+
+def fmt_rate(kps):
+    units = ("key/s", "Kkey/s", "Mkey/s", "Gkey/s", "Tkey/s", "Pkey/s", "Ekey/s")
+    i = 0
+    while kps >= 1000.0 and i < len(units) - 1:
+        kps /= 1000.0
+        i += 1
+    return "%.2f %s" % (kps, units[i])
+
+
+def fmt_span(s):
+    s = int(s)
+    if s >= 3600:
+        return "%dh %02dm" % (s // 3600, s % 3600 // 60)
+    if s >= 60:
+        return "%dm %02ds" % (s // 60, s % 60)
+    return "%ds" % s
+
+
+def render_console_stats(stats, interval, now=None):
+    now = time.time() if now is None else now
+    lw, cw = 18, 15
+    head = "keyhunt-coord live stats  %s  (every %gs)" % (
+        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)), interval)
+    lines = [head, "-" * (lw + cw * len(stats))]
+    lines.append("".ljust(lw) + "".join((w["label"] + " ").rjust(cw) for w in stats))
+    for label, key in (("nodes seen", "nodes"), ("blocks requested", "requested"),
+                       ("blocks expired", "expired"), ("blocks completed", "completed")):
+        lines.append(label.ljust(lw) + "".join(
+            ("{:,}".format(w[key]) + " ").rjust(cw) for w in stats))
+    lines.append("effective rate".ljust(lw) + "".join(
+        (fmt_rate(w["keys_per_sec"]) + ("*" if w["partial"] else " ")).rjust(cw)
+        for w in stats))
+    partial = [w for w in stats if w["partial"]]
+    if partial:
+        lines.append("* averaged over the %s of history available so far"
+                     % fmt_span(partial[0]["span"]))
+    return lines
+
+
+def run_live_stats(coord, interval):
+    console = LiveConsole()
+
+    def loop():
+        while True:
+            try:
+                console.draw(render_console_stats(coord.window_stats(), interval))
+            except Exception as e:
+                sys.stderr.write("stats display error: %r\n" % (e,))
+            time.sleep(interval)
+    threading.Thread(target=loop, name="live-stats", daemon=True).start()
+
+
 def make_handler(coord):
     class H(BaseHTTPRequestHandler):
         server_version = "keyhunt-coord/1"
 
         def log_message(self, fmt, *a):
-            if a[1] != '200':
+            if a[1] != '200' and "/favicon.ico" not in a[0]:
                 sys.stderr.write("\"%s\" %s\n" % (self.address_string(), fmt % a))
             else:
                 pass
@@ -689,6 +916,8 @@ def main():
     ap.add_argument("--db", default="coord.db")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8443)
+    ap.add_argument("--stats-interval", type=float, default=5.0,
+                    help="seconds between live console stats redraws (0 = off)")
     a = ap.parse_args()
 
     with open(a.config) as f:
@@ -715,6 +944,8 @@ def main():
                  s["skipped_dup"], waiting))
         print("                 these are handed out in file order before any random prefix")
     print("listening on   : %s:%d" % (a.host, a.port))
+    if a.stats_interval > 0:
+        run_live_stats(coord, a.stats_interval)
     ThreadingHTTPServer((a.host, a.port), make_handler(coord)).serve_forever()
 
 
