@@ -20,6 +20,7 @@ Endpoints, all POST, all taking an envelope:
 
 import argparse
 import hashlib
+import html
 import json
 import os
 import random
@@ -34,7 +35,7 @@ import protocol as P
 import secp
 
 PREFIX_HEX_LEN = 54          # 27 bytes = 216 bits
-LEASE_SECONDS = 3600
+LEASE_SECONDS = 3600         # 1 hour
 MAX_BODY = 8 * 1024 * 1024
 
 SCHEMA = """
@@ -48,6 +49,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   last_seen     REAL,
   last_seq      INTEGER NOT NULL DEFAULT 0,
   out_seq       INTEGER NOT NULL DEFAULT 0,
+  blocks_requested INTEGER NOT NULL DEFAULT 0,
   blocks_done   INTEGER NOT NULL DEFAULT 0,
   total_seconds REAL    NOT NULL DEFAULT 0,
   keys_checked  INTEGER NOT NULL DEFAULT 0
@@ -77,7 +79,10 @@ CREATE TABLE IF NOT EXISTS matches (
   note         TEXT
 );
 """
-
+class QuietHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        # Overriding this method prevents logs from printing to the console
+        pass
 
 class Coordinator:
     def __init__(self, cfg, db_path, secret, targets_path):
@@ -86,6 +91,13 @@ class Coordinator:
         self.db = sqlite3.connect(db_path, check_same_thread=False)
         self.db.executescript(SCHEMA)
         self.db.commit()
+        # Migration for databases created before blocks_requested existed.
+        try:
+            self.db.execute(
+                "ALTER TABLE nodes ADD COLUMN blocks_requested INTEGER NOT NULL DEFAULT 0")
+            self.db.commit()
+        except sqlite3.OperationalError:
+            pass  # column already present
 
         self.sign_key, self.enc_key = P.load_secret(secret)
         self.ed_hex = secret["ed25519"]
@@ -129,7 +141,7 @@ class Coordinator:
         space_prefix is configured, must start with it.
 
         Idempotent across restarts: a prefix already present in the blocks table
-        (in any state) is skipped, so re-running the server -- or adding more
+        (in any state) is skipped, sor re-running the server -- or adding more
         lines to the file and restarting -- never double-counts work.
         Returns {added, skipped_bad, skipped_dup}."""
         stats = {"added": 0, "skipped_bad": 0, "skipped_dup": 0}
@@ -246,6 +258,8 @@ class Coordinator:
                 "UPDATE blocks SET state='leased', node_id=?, leased_at=?, "
                 "lease_expires=?, attempts=attempts+1 WHERE idx=?",
                 (nid, now, exp, idx))
+            self.db.execute(
+                "UPDATE nodes SET blocks_requested=blocks_requested+1 WHERE id=?", (nid,))
             self.db.commit()
             return {"ok": True, "block_idx": idx, "prefix": prefix,
                     "reassigned": True, "from_list": False,
@@ -263,6 +277,8 @@ class Coordinator:
             self.db.execute(
                 "UPDATE blocks SET state='leased', node_id=?, leased_at=?, "
                 "lease_expires=?, attempts=1 WHERE idx=?", (nid, now, exp, idx))
+            self.db.execute(
+                "UPDATE nodes SET blocks_requested=blocks_requested+1 WHERE id=?", (nid,))
             self.db.commit()
             return {"ok": True, "block_idx": idx, "prefix": prefix,
                     "reassigned": False, "from_list": True, "attempts": 1,
@@ -276,6 +292,8 @@ class Coordinator:
             "attempts) VALUES (?,'leased',?,?,?,1) RETURNING idx",
             (prefix, nid, now, exp))
         idx = cur.fetchone()[0]
+        self.db.execute(
+            "UPDATE nodes SET blocks_requested=blocks_requested+1 WHERE id=?", (nid,))
         self.db.commit()
         return {"ok": True, "block_idx": idx, "prefix": prefix,
                 "reassigned": False, "from_list": False, "attempts": 1,
@@ -376,18 +394,33 @@ class Coordinator:
         return {"ok": True, "verified": verified, "in_targets": in_targets,
                 "duplicate": dup, "note": note}
 
-    def op_stats(self, nid, p):
+    def _node_stats_rows(self):
+        """Per-node stats, shared by the authenticated /v1/stats op and the
+        plain HTML dashboard. blocks_pending is the count of blocks currently
+        leased to that node and not yet completed (i.e. in flight)."""
         nodes = []
         for r in self.db.execute(
-                "SELECT id,gpu,sw,status,first_seen,last_seen,blocks_done,"
-                "total_seconds,keys_checked FROM nodes ORDER BY blocks_done DESC"):
+                "SELECT id,gpu,sw,status,first_seen,last_seen,blocks_requested,"
+                "blocks_done,total_seconds,keys_checked FROM nodes "
+                "ORDER BY blocks_done DESC"):
             d = dict(zip(["id", "gpu", "sw", "status", "first_seen", "last_seen",
-                          "blocks_done", "total_seconds", "keys_checked"], r))
+                          "blocks_requested", "blocks_done", "total_seconds",
+                          "keys_checked"], r))
+            d["blocks_pending"] = self.db.execute(
+                "SELECT COUNT(*) FROM blocks WHERE node_id=? AND state='leased'",
+                (d["id"],)).fetchone()[0]
+            d["blocks_expired"] = self.db.execute(
+                "SELECT COUNT(*) FROM blocks WHERE node_id=? AND state='expired'",
+                (d["id"],)).fetchone()[0]
             d["avg_seconds_per_block"] = (d["total_seconds"] / d["blocks_done"]
                                           if d["blocks_done"] else None)
             d["keys_per_sec"] = (d["keys_checked"] / d["total_seconds"]
                                  if d["total_seconds"] > 0 else None)
             nodes.append(d)
+        return nodes
+
+    def op_stats(self, nid, p):
+        nodes = self._node_stats_rows()
         leased, expired, done, pending = (self.db.execute(
             "SELECT SUM(state='leased'), SUM(state='expired'), SUM(state='done'), "
             "SUM(state='pending') FROM blocks").fetchone())
@@ -400,6 +433,148 @@ class Coordinator:
                                     + (pending or 0)},
                 "verified_matches": nmatch,
                 "targets_digest": self.targets_digest}
+
+    def render_stats_html(self):
+        """A plain, unauthenticated GET dashboard. Node ids are already public
+        (a node id *is* its Ed25519 public key), so serving this without the
+        sealed-envelope protocol leaks nothing a node itself couldn't publish;
+        it exists so a human can check progress from a browser."""
+        nodes = self._node_stats_rows()
+        leased, expired, done, pending = (self.db.execute(
+            "SELECT SUM(state='leased'), SUM(state='expired'), SUM(state='done'), "
+            "SUM(state='pending') FROM blocks").fetchone())
+        nmatch = self.db.execute(
+            "SELECT COUNT(*) FROM matches WHERE verified=1 AND in_targets=1").fetchone()[0]
+
+        def esc(s):
+            return html.escape(str(s), quote=True)
+
+        def sec_parse(s):
+            s = float(s)
+            dys, rem = divmod(s, 86400)
+            hrs, rem = divmod(rem, 3600)
+            min, sec = divmod(rem, 60)
+            return dys, hrs, min, sec
+
+        def fmt_secs(s):
+            if s is None:
+                return "-"
+            dys, hrs, min, sec = sec_parse(s)
+
+            if dys > 0:
+                return f"{dys:.0f}d {hrs:.0f}h {min:.0f}m {sec:.0f}s"
+            elif hrs > 0:
+                return f"{hrs:.0f}h {min:.0f}m {sec:.0f}s"
+            elif min > 0:
+                return f"{min:.0f}m {sec:.0f}s"
+            else:
+                return f"{sec:.0f}s"
+
+        rows = []
+        for d in nodes:
+            rateUnits = {0: 'key/s', 1: 'Kkey/s', 2: 'Mkey/s', 3: 'Gkey/s', 4: 'Tkey/s', 5: 'Pkey/s'}
+            rateScale = 0
+            while d['keys_per_sec'] >= 1000.0:
+               rateScale += 1
+               d['keys_per_sec'] /= 1000.0
+            rate = ("%.3f %s" % (d["keys_per_sec"], rateUnits[rateScale]) if d["keys_per_sec"] is not None else "-")
+            keyScale = 0
+            while d['keys_checked'] >= 1000.0:
+                keyScale += 1
+                d['keys_checked'] /= 1000.0
+            keyUnits = { 0: "",
+                         1: "Thousand",
+                         2: "Million",
+                         3: "Billion",
+                         4: "Trillion",
+                         5: "Quadrillion",
+                         6: "Quintillion",
+                         7: "Sextillion",
+                         8: "Septillion",
+                         9: "Octillion",
+                         10: "Non-octillion",
+                         11: "Decillion",
+                         12: "Undecillion",
+                         13: "Duodecillion",
+                         14: "Tredecillion",
+                         15: "Quattuordecillion",
+                         16: "Quindecillion",
+                         17: "Sexdecillion",
+                         18: "Septendecillion",
+                         19: "Octodecillion",
+                         20: "Novemdecillion"}
+            ttlKeys = ("%.3f %s (%d zeros)" % (d["keys_checked"], keyUnits[keyScale], keyScale * 3) if d["keys_checked"] is not None else "-")
+            if d["blocks_requested"] < d["blocks_done"] + d["blocks_pending"] + d["blocks_expired"]:
+                d["blocks_requested"] = d["blocks_done"] + d["blocks_pending"] + d["blocks_expired"]
+            nodePct = d["blocks_done"] / (done or 1) * 100
+            ExpireRate = d["blocks_expired"]/(d["blocks_requested"] or 1) * 100
+            PendingRate = d["blocks_pending"]/(d["blocks_requested"] or 1) * 100
+            CompleteRate = d["blocks_done"] / (d["blocks_requested"] or 1) * 100
+            rows.append(
+                "<tr>"
+                f"<td class='mono'>{esc(d["id"][:8])}...{esc(d["id"][-4:])}</td>"
+                f"<td>{esc(d["gpu"] or "unknown")}</td>"
+                f"<td>{d["blocks_pending"]:.0f} ({PendingRate:0.1f}%)</td>"
+                f"<td>{d["blocks_expired"]:.0f} ({ExpireRate:0.1f}%)</td>"
+                f"<td>{d["blocks_done"]:.0f} ({CompleteRate:0.1f}%</td>"
+                f"<td>{esc(fmt_secs(d["avg_seconds_per_block"]))}</td>"
+                f"<td>{esc(rate)}</td>"
+                f"<td>{esc(fmt_secs(d["total_seconds"]))}</td>"
+                f"<td><div class='progress-container'><div class='progress-bar' style='width: {nodePct}%;'>"
+                f"<span class='progress-text'>{nodePct:0.3f}%</span></div></div></td>"
+                "</tr>")
+        blocks_total = (leased or 0) + (expired or 0) + (done or 0) + (pending or 0)
+        table_rows = "\n".join(rows) if rows else "<tr><td colspan='10' style='text-align:center;color:#888'>no nodes yet</td></tr>"
+        page = """<!doctype html>
+                <html>
+                <head>
+                <meta charset="utf-8">
+                <meta http-equiv="refresh" content="30">
+                <title>keyhunt-coord stats</title>
+                <style>
+                  body { font: 12px/1.4 -apple-system, Segoe UI, Roboto, sans-serif;
+                         margin: 2rem; color: #1a1a1a; background: #fafafa; }
+                  h1 { font-size: 1.3rem; margin-bottom: 0.25rem; }
+                  .summary { color: #555; margin-bottom: 1.5rem; }
+                  table { border-collapse: collapse; width: 100%; background: #fff; }
+                  th, td { padding: 0.4rem 0.7rem; border-bottom: 1px solid #e0e0e0;
+                           text-align: right; vertical-align:middle; }
+                  th:nth-child(1), td:nth-child(1), th:nth-child(2), td:nth-child(2) {
+                           text-align: left; }
+                  th { background: #f0f0f0; font-weight: 600; }
+                  .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
+                  tr:hover { background: #f6f8ff; }
+                  /* The outer track of the progress bar */
+                  .progress-container {
+                      width: 100%; background-color: #e0e0e0; border-radius: 4px; overflow: hidden; height: 16px; * Thickness of the bar */
+                      position: relative;
+                    }
+                    
+                    /* The filling inner percentage bar */
+                    .progress-bar {
+                      height: 100%;
+                      background-color: #f7931a; /* Primary bar color (Bitcoin Orange) */
+                      background-image: linear-gradient(to right, #f7931a, #ffffff); /* Optional gradient */
+                      display: flex;
+                      align-items: center;
+                      justify-content: center;   /* Centers text inside the filled portion */
+                      transition: width 0.4s ease;/* Smooth transition if data updates dynamically */
+                    }    
+                    /* Text style inside the bar */
+                    .progress-text { color: #000000; font-size: 8px; font-weight: bold;
+                    }
+                </style>
+                </head>
+                <body>
+                <h1>keyhunt-coord-server</h1>
+                <div class="summary">"""
+        page += f"blocks: {done or 0:.0f} done, {leased or 0:.0f} leased, {expired or 0:.0f} expired, {pending or 0:.0f} pending, {blocks_total:.0f} total &middot;"
+        page += f"verified matches: {nmatch} &middot; targets: {len(self.targets):0d} (digest {esc(self.targets_digest[:16])})</div>"
+        page += f"<table><thead><tr><th>Node</th><th>GPU</th><th>Pending</th><th>Expired</th>"
+        page += f"<th>Completed</th><th>Avg Block Time</th><th>Avg Rate</th><th>Total Time</th><th>Share of Work</th>"
+        page += f"</tr></thead><tbody>{table_rows}</tbody></table></body></html>"
+
+        return page.encode()
 
     OPS = {
         "/v1/register": ("register", op_register, False),
@@ -468,7 +643,10 @@ def make_handler(coord):
         server_version = "keyhunt-coord/1"
 
         def log_message(self, fmt, *a):
-            sys.stderr.write("%s %s\n" % (self.address_string(), fmt % a))
+            if a[1] != '200':
+                sys.stderr.write("\"%s\" %s\n" % (self.address_string(), fmt % a))
+            else:
+                pass
 
         def _send(self, code, obj):
             b = json.dumps(obj).encode()
@@ -481,6 +659,13 @@ def make_handler(coord):
         def do_GET(self):
             if self.path == "/healthz":
                 self._send(200, {"ok": True, "service": "keyhunt-coord"})
+            elif self.path in ("/", "/stats.html"):
+                body = coord.render_stats_html()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             else:
                 self._send(404, {"error": "not found"})
 

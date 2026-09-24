@@ -26,10 +26,16 @@ in sync when the wire format changes.
 - **match** — a node reports the 32-byte private key and 33-byte compressed
   public key, both hex. **The server recomputes the public key from the private
   key itself before believing it**, so a node cannot fake a hit.
-- **stats** — per-node blocks completed, total and average processing time,
-  derived keys/sec, plus global block and match counts.
+- **stats** — per-node prefixes requested, processed and currently pending,
+  total keys and processing time, derived average processing rate, plus
+  global block and match counts.
 
-`/healthz` is a plain unauthenticated GET for liveness checks.
+`/healthz` is a plain unauthenticated GET for liveness checks. `/` and
+`/stats.html` are a plain unauthenticated GET dashboard: an HTML page listing
+the same per-node numbers (node id, GPU type, prefixes requested / processed
+/ pending, total keys processed, total processing time, average processing
+rate) for viewing in a browser. It's safe to leave open to the public --
+a node id is already its Ed25519 public key.
 
 ## Security model
 
