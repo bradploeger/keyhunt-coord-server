@@ -45,7 +45,7 @@ MAX_BODY = 8 * 1024 * 1024
 BLOCK_KEYS = 1 << (256 - 4 * PREFIX_HEX_LEN)   # keys in one block (2^40)
 
 # Rolling windows shown on the live console display: (label, seconds).
-STATS_WINDOWS = (("last 10m", 600), ("last 1h", 3600), ("last 24h", 86400))
+STATS_WINDOWS = (("last 15m", 900), ("last 1h", 3600), ("last 24h", 86400))
 EVENT_RETENTION = 86400 + 3600   # keep a little more than the widest window
 
 SCHEMA = """
@@ -78,14 +78,16 @@ CREATE TABLE IF NOT EXISTS blocks (
 -- Expired blocks are re-handed oldest-first, so index by (state, lease_expires).
 CREATE INDEX IF NOT EXISTS blocks_state ON blocks(state, lease_expires);
 -- Append-only log of block lifecycle events for the rolling console stats.
--- kind is 'request' | 'expire' | 'complete'; keys is set on 'complete'.
+-- kind is 'request' | 'expire' | 'complete'; keys and seconds (the node's
+-- reported processing time for the block) are set on 'complete'.
 -- Pruned to the last ~25 hours.
 CREATE TABLE IF NOT EXISTS events (
   ts            REAL NOT NULL,
   kind          TEXT NOT NULL,
   node_id       TEXT,
   block_idx     INTEGER,
-  keys          INTEGER NOT NULL DEFAULT 0
+  keys          INTEGER NOT NULL DEFAULT 0,
+  seconds       REAL
 );
 CREATE INDEX IF NOT EXISTS events_kind_ts ON events(kind, ts);
 CREATE TABLE IF NOT EXISTS matches (
@@ -118,6 +120,17 @@ class Coordinator:
         self.started_at = time.time()
         if not had_events:
             self._backfill_events()
+        else:
+            # Migration: events tables created before 'seconds' existed. Fill
+            # it in for logged completions from the block's reported time.
+            try:
+                self.db.execute("ALTER TABLE events ADD COLUMN seconds REAL")
+                self.db.execute(
+                    "UPDATE events SET seconds=(SELECT seconds FROM blocks "
+                    "WHERE blocks.idx=events.block_idx) WHERE kind='complete'")
+                self.db.commit()
+            except sqlite3.OperationalError:
+                pass  # column already present
         # Migration for databases created before blocks_requested existed.
         try:
             self.db.execute(
@@ -212,10 +225,11 @@ class Coordinator:
         return stats
 
     # ------------------------------------------------------------ event log
-    def _log_event(self, kind, nid, idx, keys=0, ts=None):
+    def _log_event(self, kind, nid, idx, keys=0, ts=None, seconds=None):
         self.db.execute(
-            "INSERT INTO events(ts, kind, node_id, block_idx, keys) VALUES (?,?,?,?,?)",
-            (time.time() if ts is None else ts, kind, nid, idx, int(keys)))
+            "INSERT INTO events(ts, kind, node_id, block_idx, keys, seconds) "
+            "VALUES (?,?,?,?,?,?)",
+            (time.time() if ts is None else ts, kind, nid, idx, int(keys), seconds))
 
     def _backfill_events(self):
         """First start on a database that predates the events table: seed the
@@ -233,8 +247,8 @@ class Coordinator:
             "SELECT lease_expires, 'expire', node_id, idx, 0 FROM blocks "
             "WHERE state='expired' AND lease_expires >= ?", (since,))
         self.db.execute(
-            "INSERT INTO events(ts, kind, node_id, block_idx, keys) "
-            "SELECT completed_at, 'complete', node_id, idx, ? FROM blocks "
+            "INSERT INTO events(ts, kind, node_id, block_idx, keys, seconds) "
+            "SELECT completed_at, 'complete', node_id, idx, ?, seconds FROM blocks "
             "WHERE state='done' AND completed_at >= ?", (BLOCK_KEYS, since))
         self.db.commit()
 
@@ -258,35 +272,35 @@ class Coordinator:
         (so expiries show up when they happen, not when the next node asks for
         work) and prunes old events. Takes self.lock.
 
-        Effective rate is keys from blocks completed in the window divided by
-        the window length -- or by the available history, if the server has
-        less than a full window of it (flagged by 'partial')."""
+        Effective rate is the combined throughput of all nodes: for each node
+        that completed blocks in the window, its keys divided by the processing
+        time it reported for those blocks, summed across nodes."""
         now = time.time() if now is None else now
         with self.lock:
             self._expire_leases(now)
             self.db.execute("DELETE FROM events WHERE ts < ?",
                             (now - EVENT_RETENTION,))
             self.db.commit()
-            first = self.db.execute("SELECT MIN(ts) FROM events").fetchone()[0]
-            origin = min(self.started_at, first if first is not None else now)
             out = []
             for label, secs in STATS_WINDOWS:
                 cut = now - secs
                 nodes = self.db.execute(
                     "SELECT COUNT(*) FROM nodes WHERE last_seen >= ?",
                     (cut,)).fetchone()[0]
-                req, exp, done, keys = self.db.execute(
+                req, exp, done = self.db.execute(
                     "SELECT COALESCE(SUM(kind='request'),0), "
                     "COALESCE(SUM(kind='expire'),0), "
-                    "COALESCE(SUM(kind='complete'),0), "
-                    "COALESCE(SUM(CASE WHEN kind='complete' THEN keys END),0) "
+                    "COALESCE(SUM(kind='complete'),0) "
                     "FROM events WHERE ts >= ? AND ts <= ?", (cut, now)).fetchone()
-                span = max(1.0, min(float(secs), now - origin))
+                per_node = self.db.execute(
+                    "SELECT SUM(keys), SUM(seconds) FROM events "
+                    "WHERE kind='complete' AND seconds > 0 AND ts >= ? AND ts <= ? "
+                    "GROUP BY node_id", (cut, now)).fetchall()
+                rate = (sum(k / sec for k, sec in per_node) if per_node else None)
                 out.append({"label": label, "seconds": secs, "nodes": nodes,
                             "requested": req, "expired": exp, "completed": done,
-                            "keys": keys, "span": span,
-                            "partial": span < secs - 1,
-                            "keys_per_sec": keys / span})
+                            "keys": sum(k for k, _ in per_node),
+                            "keys_per_sec": rate})
         return out
 
     # ------------------------------------------------------------- node state
@@ -445,7 +459,7 @@ class Coordinator:
             "UPDATE nodes SET blocks_done=blocks_done+1, total_seconds=total_seconds+?, "
             "keys_checked=keys_checked+?, last_seen=? WHERE id=?",
             (secs, keys, time.time(), nid))
-        self._log_event("complete", nid, idx, keys=keys)
+        self._log_event("complete", nid, idx, keys=keys, seconds=secs)
         self.db.commit()
         done, total = self.db.execute(
             "SELECT (SELECT COUNT(*) FROM blocks WHERE state='done'), COUNT(*) FROM blocks"
@@ -623,7 +637,7 @@ class Coordinator:
                 f"<td>{esc(d["gpu"] or "unknown")}</td>"
                 f"<td>{d["blocks_pending"]:.0f} ({PendingRate:0.1f}%)</td>"
                 f"<td>{d["blocks_expired"]:.0f} ({ExpireRate:0.1f}%)</td>"
-                f"<td>{d["blocks_done"]:.0f} ({CompleteRate:0.1f}%</td>"
+                f"<td>{d["blocks_done"]:.0f} ({CompleteRate:0.1f}%)</td>"
                 f"<td>{esc(fmt_secs(d["avg_seconds_per_block"]))}</td>"
                 f"<td>{esc(rate)}</td>"
                 f"<td>{esc(fmt_secs(d["total_seconds"]))}</td>"
@@ -677,7 +691,7 @@ class Coordinator:
                 <div class="summary">"""
         page += f"blocks: {done or 0:.0f} done, {leased or 0:.0f} leased, {expired or 0:.0f} expired, {pending or 0:.0f} pending, {blocks_total:.0f} total &middot;"
         page += f"verified matches: {nmatch} &middot; targets: {len(self.targets):0d} (digest {esc(self.targets_digest[:16])})</div>"
-        page += f"<table><thead><tr><th>Node</th><th>GPU</th><th>Pending</th><th>Expired</th>"
+        page += f"<table><thead><tr><th>Node</th><th>GPU</th><th>Leased</th><th>Expired</th>"
         page += f"<th>Completed</th><th>Avg Block Time</th><th>Avg Rate</th><th>Total Time</th><th>Share of Work</th>"
         page += f"</tr></thead><tbody>{table_rows}</tbody></table></body></html>"
 
@@ -822,15 +836,6 @@ def fmt_rate(kps):
     return "%.2f %s" % (kps, units[i])
 
 
-def fmt_span(s):
-    s = int(s)
-    if s >= 3600:
-        return "%dh %02dm" % (s // 3600, s % 3600 // 60)
-    if s >= 60:
-        return "%dm %02ds" % (s // 60, s % 60)
-    return "%ds" % s
-
-
 def render_console_stats(stats, interval, now=None):
     now = time.time() if now is None else now
     lw, cw = 18, 15
@@ -843,12 +848,8 @@ def render_console_stats(stats, interval, now=None):
         lines.append(label.ljust(lw) + "".join(
             ("{:,}".format(w[key]) + " ").rjust(cw) for w in stats))
     lines.append("effective rate".ljust(lw) + "".join(
-        (fmt_rate(w["keys_per_sec"]) + ("*" if w["partial"] else " ")).rjust(cw)
-        for w in stats))
-    partial = [w for w in stats if w["partial"]]
-    if partial:
-        lines.append("* averaged over the %s of history available so far"
-                     % fmt_span(partial[0]["span"]))
+        ((fmt_rate(w["keys_per_sec"]) if w["keys_per_sec"] is not None else "-")
+         + " ").rjust(cw) for w in stats))
     return lines
 
 
