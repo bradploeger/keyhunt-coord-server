@@ -9,6 +9,7 @@ Checks:
   - a space_prefix constraint is enforced against listed prefixes
   - seeding is idempotent across a restart (same DB, file re-read)
   - stats report the pending count
+  - clear_pending removes only pending blocks
 """
 import json, os, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -115,6 +116,16 @@ def main():
     check("total counts all states", st2["blocks"]["total"] ==
           st2["blocks"]["leased"] + st2["blocks"]["expired"]
           + st2["blocks"]["done"] + st2["blocks"]["pending"])
+
+    print("\n[clear_pending removes only pending blocks]")
+    removed = S.clear_pending(c4.db)
+    check("clear_pending removed the 2 waiting", removed == 2)
+    st3 = c4.op_stats("nodeA", {})
+    check("pending == 0 after clear", st3["blocks"]["pending"] == 0)
+    check("leased block kept", st3["blocks"]["leased"] == 1)
+    r = c4.op_block_request("nodeA", {})
+    check("next request falls back to random",
+          not r.get("from_list") and r["prefix"] not in listed)
 
     for f in ["pl1.db", "pl2.db", "pl3.db", "pl4.db", "plist.txt", "plist2.txt",
               "targets_pl.txt", "server.key", "server.pub"]:

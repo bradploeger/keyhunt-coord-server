@@ -142,6 +142,18 @@ the server, or append more lines to the file and restart, without duplicating
 work. Progress shows up in `stats` as `blocks.pending` (listed prefixes not yet
 handed out).
 
+To drop every listed prefix that hasn't been handed out yet, run:
+
+```
+python3 server.py --clear-pending --db coord.db --config coord.json
+```
+
+This deletes all `pending` blocks and exits; leased, expired and done blocks
+are kept. Because seeding only skips prefixes already in the database, the
+server will re-add the cleared prefixes on its next start if
+`prefix_list_file` still lists them — remove or empty that file (or drop the
+setting) first if you want them gone for good.
+
 Provide a `targets.txt` (one compressed pubkey per line). Then run:
 
 ```
@@ -187,7 +199,8 @@ complete a block after a reassignment.
 handed out in file order ahead of random assignment, expired blocks still take
 priority over the list, malformed and out-of-`space_prefix` lines are skipped,
 the list falls back to random once exhausted, seeding is idempotent across a
-restart, and `stats` reports the pending count.
+restart, `stats` reports the pending count, and `--clear-pending`'s
+`clear_pending` removes only pending blocks.
 
 `test_e2e.py` starts a real server on a random localhost port and checks
 registration, target download, random-prefix block leasing across two nodes,
