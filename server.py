@@ -910,6 +910,15 @@ def make_handler(coord):
     return H
 
 
+def clear_pending(db):
+    """Delete every 'pending' block -- prefix-list entries not yet handed to
+    any node. Leased, expired and done blocks are untouched. Returns the
+    number of rows removed."""
+    n = db.execute("DELETE FROM blocks WHERE state='pending'").rowcount
+    db.commit()
+    return n
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="coord.json")
@@ -919,7 +928,26 @@ def main():
     ap.add_argument("--port", type=int, default=8443)
     ap.add_argument("--stats-interval", type=float, default=5.0,
                     help="seconds between live console stats redraws (0 = off)")
+    ap.add_argument("--clear-pending", action="store_true",
+                    help="delete all pending (not yet handed out) blocks from "
+                         "--db and exit")
     a = ap.parse_args()
+
+    if a.clear_pending:
+        if not os.path.exists(a.db):
+            raise SystemExit("no database at %s" % a.db)
+        db = sqlite3.connect(a.db, timeout=30)
+        print("cleared %d pending block(s) from %s" % (clear_pending(db), a.db))
+        try:
+            with open(a.config) as f:
+                plf = json.load(f).get("prefix_list_file")
+        except (OSError, ValueError):
+            plf = None
+        if plf:
+            print("note: %s re-seeds any prefix it lists that is not in the "
+                  "database on the next start; remove or empty "
+                  "prefix_list_file to keep them cleared" % plf)
+        return
 
     with open(a.config) as f:
         cfg = json.load(f)
