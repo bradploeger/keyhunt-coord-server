@@ -65,8 +65,11 @@ class TestClient:
                            "keys_checked": keys_checked})
 
     def report_match(self, privkey_hex, pubkey_hex, block_idx=-1):
+        # Seal the private key to the server's X25519 key, mirroring what
+        # keyhunt-gpu does on a real match. The server opens and re-verifies it.
+        sealed = P.seal_secret(bytes.fromhex(privkey_hex), self.server_x)
         return self._call("/v1/match", "match",
-                          {"privkey": privkey_hex, "pubkey": pubkey_hex,
+                          {"privkey_sealed": sealed, "pubkey": pubkey_hex,
                            "block_idx": block_idx})
 
     def stats(self):

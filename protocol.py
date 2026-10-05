@@ -185,3 +185,60 @@ def open_envelope(env, my_ed_pub_hex, my_x_priv, lookup_sender_x,
     if not isinstance(payload, dict):
         raise ProtocolError("payload must be an object")
     return sender.hex(), payload, ts, seq
+
+# ======================================================================= seal
+# One-shot "sealed box" for a secret (e.g. a recovered private key), encrypted
+# to an X25519 public key only. Unlike seal()/open_envelope() above there is no
+# sender identity and no signature: anyone may produce one, only the holder of
+# the recipient's X25519 secret can open it. Same primitives as the envelope
+# (ephemeral X25519 -> HKDF-SHA256 -> ChaCha20-Poly1305), so no new dependency.
+#
+# Wire layout (then hex-encoded):  epk(32) || nonce(12) || ciphertext(pt+16)
+MAGIC_SEAL = b"KHSEAL1"
+
+
+def _seal_key(shared, epk, recipient_x, nonce):
+    info = MAGIC_SEAL + epk + recipient_x
+    return (HKDF(algorithm=hashes.SHA256(), length=32, salt=nonce, info=info).derive(shared), info)
+
+
+def seal_secret(plaintext, recipient_x_hex):
+    """Seal bytes to an X25519 public key (hex). Returns a hex string."""
+    if not isinstance(plaintext, (bytes, bytearray)):
+        raise TypeError("plaintext must be bytes")
+    recipient_x = bytes.fromhex(recipient_x_hex)
+    if len(recipient_x) != 32:
+        raise ProtocolError("recipient x25519 key must be 32 bytes")
+    rx = X25519PublicKey.from_public_bytes(recipient_x)
+    eph = X25519PrivateKey.generate()
+    epk = raw_pub(eph.public_key())
+    nonce = os.urandom(12)
+    key, info = _seal_key(eph.exchange(rx), epk, recipient_x, nonce)
+    ct = ChaCha20Poly1305(key).encrypt(nonce, bytes(plaintext), info)
+    return (epk + nonce + ct).hex()
+
+
+def open_sealed(blob_hex, recipient_x_priv, recipient_x_hex=None):
+    """Open a sealed blob with the recipient's X25519 secret. Returns bytes.
+
+    recipient_x_hex is the recipient's own X25519 public key; if omitted it is
+    derived from the secret. It is bound into the key derivation, so a blob
+    sealed to a different key fails to open.
+    """
+    try:
+        blob = bytes.fromhex(blob_hex)
+    except (ValueError, TypeError) as e:
+        raise ProtocolError("malformed sealed blob: %s" % e)
+    if len(blob) < 32 + 12 + 16:
+        raise ProtocolError("sealed blob too short")
+    epk, nonce, ct = blob[:32], blob[32:44], blob[44:]
+    if recipient_x_hex is None:
+        recipient_x = raw_pub(recipient_x_priv.public_key())
+    else:
+        recipient_x = bytes.fromhex(recipient_x_hex)
+    shared = recipient_x_priv.exchange(X25519PublicKey.from_public_bytes(epk))
+    key, info = _seal_key(shared, epk, recipient_x, nonce)
+    try:
+        return ChaCha20Poly1305(key).decrypt(nonce, ct, info)
+    except Exception:
+        raise ProtocolError("sealed-box decryption failed")

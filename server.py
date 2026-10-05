@@ -467,15 +467,27 @@ class Coordinator:
         return {"ok": True, "block_idx": idx, "blocks_done": done, "blocks_total": total}
 
     def op_match(self, nid, p):
-        priv = str(p.get("privkey", "")).lower().strip()
+        # The node reports the found private key only as a sealed box, encrypted
+        # to this server's X25519 key. The node never sees the key in the clear;
+        # we open it here and then re-verify it independently, exactly as before.
+        sealed = str(p.get("privkey_sealed", "")).strip()
         pub = str(p.get("pubkey", "")).lower().strip()
         try:
             idx = int(p.get("block_idx", -1))
         except (ValueError, TypeError):
             idx = -1
 
-        if len(priv) != 64 or len(pub) != 66 or pub[:2] not in ("02", "03"):
-            return {"ok": False, "error": "expect 64-hex private key and 66-hex compressed public key"}
+        if not sealed:
+            return {"ok": False, "error": "missing privkey_sealed (sealed private key)"}
+        if len(pub) != 66 or pub[:2] not in ("02", "03"):
+            return {"ok": False, "error": "expect a 66-hex compressed public key"}
+        try:
+            priv_bytes = P.open_sealed(sealed, self.enc_key, self.x_hex)
+        except P.ProtocolError as e:
+            return {"ok": False, "error": "cannot open sealed private key: %s" % e}
+        if len(priv_bytes) != 32:
+            return {"ok": False, "error": "sealed payload is not a 32-byte private key"}
+        priv = priv_bytes.hex()
         try:
             k = int(priv, 16)
             int(pub, 16)
