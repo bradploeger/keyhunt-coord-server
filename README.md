@@ -23,8 +23,11 @@ in sync when the wire format changes.
   The response carries `reassigned` and `from_list` flags saying which path it
   took.
 - **block/complete** — a node reports a block done and how long it took.
-- **match** — a node reports the 32-byte private key and 33-byte compressed
-  public key, both hex. **The server recomputes the public key from the private
+- **match** — a node reports a found key as a **sealed box**: the 32-byte
+  private key encrypted to this server's X25519 key (produced by keyhunt-gpu,
+  same `protocol.py` sealing), plus the 33-byte compressed public key in hex.
+  The node never holds the private key in the clear. The server opens the sealed
+  box with its X25519 secret and **recomputes the public key from the private
   key itself before believing it**, so a node cannot fake a hit.
 - **stats** — per-node prefixes requested, processed and currently pending,
   total keys and processing time, derived average processing rate, plus
