@@ -3,6 +3,9 @@
 *.key
 *.pub
 
+# Backups -- DO NOT COMMIT
+*.bak
+
 # Runtime state and generated data
 *.db
 targets.txt
@@ -10,6 +13,7 @@ coord.json
 planted.json
 found.txt
 state.txt
+prefixes.txt
 
 # Keep example configs (they have no '.key'/'.pub'/'.db' suffix, so they are safe)
 

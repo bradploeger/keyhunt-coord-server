@@ -85,6 +85,8 @@ test_e2e.py            live-server integration + security tests
 test_random_prefix.py  unit tests for random prefixes + expired-block reassignment
 test_prefix_list.py    unit tests for the preassigned prefix-list feature
 _testclient.py         minimal client used only by test_e2e.py
+test_bootstrap.py      backups production files, generates fixutres, runs test_e2e.py
+                       and restores the production files when fininshed..
 ```
 
 ## Setup
@@ -186,6 +188,8 @@ network.
 python3 test_random_prefix.py      # random block model, no server needed
 python3 test_prefix_list.py        # preassigned prefix-list feature, no server needed
 python3 test_e2e.py                # full live-server run (generate fixtures first)
+python3 bootstrap_test.py          # full live-server run handles file backup, fixture 
+                                     generation, and file restoration
 ```
 
 `test_random_prefix.py` drives the `Coordinator` directly and checks that new
@@ -207,21 +211,11 @@ registration, target download, random-prefix block leasing across two nodes,
 completion, rejection of nonexistent-block completion, match verification
 (including a node lying about the keypair), duplicate detection, stats, and four
 security properties: tampered ciphertext, replayed sequence number, wrong
-recipient, and an unregistered node trying to lease. Generate fixtures first:
+recipient, and an unregistered node trying to lease. It is easier to just use the test
+bootstrapping tool: 
 
 ```
-python3 keygen.py server.key
-python3 keygen.py node1.key
-python3 - <<'PY'
-import json, random
-from secp import compressed, N
-random.seed(3); priv = random.randrange(1, N)
-lines = [compressed(priv)] + [compressed(random.randrange(1, N)) for _ in range(999)]
-random.shuffle(lines); open("targets.txt","w").write("\n".join(lines)+"\n")
-json.dump({"targets_file":"targets.txt","lease_seconds":3600}, open("coord.json","w"))
-json.dump({"priv":"%064x"%priv,"pub":compressed(priv)}, open("planted.json","w"))
-PY
-python3 test_e2e.py
+python3 test_bootstrap.py
 ```
 
 ## Notes and limits
