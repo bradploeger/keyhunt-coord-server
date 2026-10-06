@@ -185,6 +185,20 @@ pointing it at Postgres is a small change if you outgrow that. There is no
 built-in rate limiting; add it at the proxy if you expose this to an untrusted
 network.
 
+## Running on Cloudflare (Python Worker + D1)
+
+The `worker/` directory runs the same server as a **Cloudflare Python Worker**
+backed by a **D1** database instead of the stdlib HTTP server and SQLite. The
+wire protocol is identical, so deployed `keyhunt-node` / `keyhunt-gpu` clients
+need no changes. Because Cloudflare's Pyodide runtime cannot import
+`cryptography`/`PyNaCl` (and WebCrypto lacks ChaCha20-Poly1305), the four
+primitives the protocol uses are reimplemented stdlib-only in
+`worker/src/khcrypto.py`, byte-for-byte compatible with `protocol.py` (proven by
+`worker/test_khcrypto.py`). See `worker/README.md` for the deploy steps
+(`wrangler d1 create`, `schema.sql`, `wrangler secret put SERVER_KEY`, seed the
+targets, `wrangler deploy`). Deploy on the Workers Paid plan — the pure-Python
+crypto runs per request.
+
 ## Test
 
 ```

@@ -29,3 +29,7 @@ venv/
 .idea/
 *.swp
 .DS_Store
+
+# Cloudflare Worker deploy artifacts
+worker/seed.sql
+worker/.wrangler/
