@@ -572,6 +572,9 @@ class Coordinator:
         (a node id *is* its Ed25519 public key), so serving this without the
         sealed-envelope protocol leaks nothing a node itself couldn't publish;
         it exists so a human can check progress from a browser."""
+        # Same rolling windows as the live console display; this also sweeps
+        # expired leases and prunes old events, so the counts below are fresh.
+        wins = self.window_stats()
         nodes = self._node_stats_rows()
         leased, expired, done, pending = (self.db.execute(
             "SELECT SUM(state='leased'), SUM(state='expired'), SUM(state='done'), "
@@ -602,6 +605,27 @@ class Coordinator:
                 return f"{min:.0f}m {sec:.0f}s"
             else:
                 return f"{sec:.0f}s"
+
+        # Rolling-window table (last 15m / 1h / 24h), mirroring the console.
+        win_labels = "".join(f"<th>{esc(w['label'])}</th>" for w in wins)
+
+        def _wrow(name, key):
+            cells = "".join(f"<td>{w[key]:,}</td>" for w in wins)
+            return f"<tr><th>{name}</th>{cells}</tr>"
+
+        rate_cells = "".join(
+            f"<td>{esc(fmt_rate(w['keys_per_sec']) if w['keys_per_sec'] is not None else '-')}</td>"
+            for w in wins)
+        window_table = (
+            "<h2>Rolling activity</h2>"
+            "<table class='windows'><thead><tr><th>metric</th>" + win_labels +
+            "</tr></thead><tbody>" +
+            _wrow("nodes seen", "nodes") +
+            _wrow("blocks requested", "requested") +
+            _wrow("blocks expired", "expired") +
+            _wrow("blocks completed", "completed") +
+            f"<tr><th>effective rate</th>{rate_cells}</tr>" +
+            "</tbody></table>")
 
         rows = []
         for d in nodes:
@@ -696,6 +720,13 @@ class Coordinator:
                     /* Text style inside the bar */
                     .progress-text { color: #000000; font-size: 8px; font-weight: bold;
                     }
+                  h2 { font-size: 1rem; margin: 1.25rem 0 0.4rem; color: #333; }
+                  /* Rolling-window table: metric names left, windows right.
+                     Declared after the global nth-child rule so these win. */
+                  .windows { width: auto; min-width: 380px; margin-bottom: 1.25rem; }
+                  .windows th, .windows td { text-align: right; }
+                  .windows th:first-child, .windows td:first-child {
+                           text-align: left; font-weight: 600; }
                 </style>
                 </head>
                 <body>
@@ -703,6 +734,7 @@ class Coordinator:
                 <div class="summary">"""
         page += f"blocks: {done or 0:.0f} done, {leased or 0:.0f} leased, {expired or 0:.0f} expired, {pending or 0:.0f} pending, {blocks_total:.0f} total &middot;"
         page += f"verified matches: {nmatch} &middot; targets: {len(self.targets):0d} (digest {esc(self.targets_digest[:16])})</div>"
+        page += window_table
         page += f"<table><thead><tr><th>Node</th><th>GPU</th><th>Leased</th><th>Expired</th>"
         page += f"<th>Completed</th><th>Avg Block Time</th><th>Avg Rate</th><th>Total Time</th><th>Share of Work</th>"
         page += f"</tr></thead><tbody>{table_rows}</tbody></table></body></html>"

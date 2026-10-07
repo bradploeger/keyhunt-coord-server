@@ -37,8 +37,10 @@ in sync when the wire format changes.
 `/stats.html` are a plain unauthenticated GET dashboard: an HTML page listing
 the same per-node numbers (node id, GPU type, prefixes requested / processed
 / pending, total keys processed, total processing time, average processing
-rate) for viewing in a browser. It's safe to leave open to the public --
-a node id is already its Ed25519 public key.
+rate) for viewing in a browser, plus a "Rolling activity" table with the same
+last-15m / last-1h / last-24h windows as the live console (nodes seen, blocks
+requested / expired / completed, and effective rate). It's safe to leave open to
+the public -- a node id is already its Ed25519 public key.
 
 ### Live console stats
 
