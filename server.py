@@ -429,18 +429,57 @@ class Coordinator:
             idx = int(p["block_idx"])
             secs = float(p["seconds"])
             keys = int(p.get("keys_checked", 0))
+            p_hash = str(p["p_hash"]).strip()
+            proof = str(p["proof"]).strip()
         except (KeyError, ValueError, TypeError):
             return {"ok": False, "error": "bad fields"}
-        if not (0 <= secs < 30 * 86400) or keys < 0:
+        if not (10 <= secs < 30 * 86400) or keys < 0:
             return {"ok": False, "error": "implausible timing"}
 
-        row = self.db.execute("SELECT state,node_id FROM blocks WHERE idx=?",
+        row = self.db.execute("SELECT state,node_id, prefix FROM blocks WHERE idx=?",
                               (idx,)).fetchone()
         if not row:
             return {"ok": False, "error": "no such block"}
-        state, owner = row
+        state, owner, prefix = row
+
         if state == "done":
             return {"ok": True, "note": "already recorded"}
+
+        range_nibs = 64 - len(prefix)
+        digest = hashlib.sha512(prefix.encode("utf-8")).hexdigest()
+        num_proofs = (int(digest[-8:], 16) % 9) + 4
+        stop = range_nibs * num_proofs
+        proof_ids = [prefix + digest[i:stop:num_proofs] for i in range(num_proofs)]
+        proof_tg = [secp.compressed(int(pid, 16)) for pid in proof_ids]
+        p_hash_input = "".join(proof_ids)
+        proof_hash = hashlib.sha256(p_hash_input.encode("utf-8").strip()).hexdigest()
+        if p_hash != proof_hash:
+            return {"ok": False, "error": "invalid proof of work hash"}
+        for sealed in proof.split("."):
+            if not sealed:
+                return {"ok": False, "error": "no sealed proof of work"}
+            try:
+                priv_bytes = P.open_sealed(sealed, self.enc_key, self.x_hex)
+            except P.ProtocolError as e:
+                return {"ok": False, "error": "protocal error in proof of work: %s" % e}
+            if len(priv_bytes) != 32:
+                return {"ok": False, "error": "sealed proof of work key not valid"}
+            priv = priv_bytes.hex()
+            try:
+                k = int(priv, 16)
+            except ValueError:
+                return {"ok": False, "error": "invalid proof of work received - not hex"}
+            if not (0 < k < secp.N):
+                return {"ok": False, "error": "invalid proof of work received - out of range"}
+            derived = secp.compressed(k)
+            if priv in proof_ids:
+                proof_ids.remove(priv)
+            if derived in proof_tg:
+                proof_tg.remove(derived)
+        if len(proof_ids) | len(proof_tg):
+            print("proof ids: ", proof_ids)
+            print("proof_tg: ", proof_tg)
+            return {"ok": False, "error": "proof of work not complete"}
 
         # Only the node currently holding the lease may complete it. If A's lease
         # expired and the prefix was re-handed to B, A's late report is stale: B is
